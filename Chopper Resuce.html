@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Retro Chopper Rescue</title>
+    <style>
+        /* Keep it retro: Black background, centered game screen */
+        body {
+            background-color: #000;
+            color: #fff;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Courier New', Courier, monospace; /* Classic monospaced font */
+            overflow: hidden;
+        }
+
+        /* The Canvas acts as our low-res retro monitor */
+        canvas {
+            background-color: #000;
+            border: 4px solid #fff;
+            /* Force pixelated scaling to make it look old-school */
+            image-rendering: pixelated;
+            max-width: 95vw;
+            max-height: 80vh; /* Prevents the top of the canvas from being pushed off-screen */
+            aspect-ratio: 4 / 3;
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.2);
+        }
+
+        .instructions {
+            margin-top: 15px;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .instructions span {
+            font-weight: bold;
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas" width="640" height="480"></canvas>
+    
+    <div class="instructions">
+        <p><span>ARROW KEYS</span> to Fly. Rescue the person on the left, return to the right.</p>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // --- GAME STATE ---
+        let gameState = 'START'; // START, PLAYING, CRASHED, GAMEOVER
+        let score = 0;
+        let lives = 5;
+        let frameCount = 0;
+
+        // --- AUDIO SYSTEM ---
+        let audioCtx;
+        let lastChop = 0;
+
+        function initAudio() {
+            if (audioCtx) return;
+            // Safari uses webkitAudioContext
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+        }
+
+        function playChop(speedRatio) {
+            if (!audioCtx || audioCtx.state !== 'running') return;
+            let now = audioCtx.currentTime;
+            // Faster chop sound when moving vertically (thrusting)
+            let chopInterval = 0.1 - (speedRatio * 0.05);
+            if (now - lastChop > chopInterval) {
+                lastChop = now;
+                let osc = audioCtx.createOscillator();
+                let gain = audioCtx.createGain();
+                osc.type = 'square'; // Harsh, retro wave
+                osc.frequency.setValueAtTime(40 + Math.random() * 5, now);
+                gain.gain.setValueAtTime(0.05, now);
+                gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start(now);
+                osc.stop(now + 0.05);
+            }
+        }
+
+        function playShoot() {
+            if (!audioCtx || audioCtx.state !== 'running') return;
+            let now = audioCtx.currentTime;
+            let osc = audioCtx.createOscillator();
+            let gain = audioCtx.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(300, now);
+            osc.frequency.exponentialRampToValueAtTime(50, now + 0.1);
+            gain.gain.setValueAtTime(0.05, now);
+            gain.gain.linearRampToValueAtTime(0, now + 0.1);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(now);
+            osc.stop(now + 0.1);
+        }
+
+        function playCrash() {
+            if (!audioCtx || audioCtx.state !== 'running') return;
+            let now = audioCtx.currentTime;
+            let osc = audioCtx.createOscillator();
+            let gain = audioCtx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(100, now);
+            osc.frequency.exponentialRampToValueAtTime(10, now + 0.5);
+            gain.gain.setValueAtTime(0.2, now);
+            gain.gain.linearRampToValueAtTime(0, now + 0.5);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(now);
+            osc.stop(now + 0.5);
+        }
+
+        // --- KEYBOARD INPUT ---
+        const keys = {
+            ArrowUp: false,
+            ArrowDown: false,
+            ArrowLeft: false,
+            ArrowRight: false,
+            w: false, a: false, s: false, d: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+            
+            initAudio(); // Initialize audio on first user interaction
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
+            // Handle UI Flow: START -> PLAYING -> GAMEOVER -> START
+            if (gameState === 'START') {
+                resetGame();
+                gameState = 'PLAYING';
+            } else if (gameState === 'GAMEOVER') {
+                gameState = 'START';
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+        });
+
+        // --- GAME OBJECTS ---
+
+        const chopper = {
+            x: 580,
+            y: 380,
+            vx: 0,
+            vy: 0,
+            width: 30,
+            height: 14,
+            hasPerson: false,
+            crashed: false
+        };
+
+        const pads = {
+            left: { x: 0, width: 80, y: 400 },
+            right: { x: 560, width: 80, y: 400 }
+        };
+
+        // The jagged C64 style mountains
+        const terrain = [
+            { x: 0, y: 400 },
+            { x: 80, y: 400 },   // End Left Pad
+            { x: 120, y: 320 },
+            { x: 180, y: 360 },
+            { x: 250, y: 200 },  // High Peak
+            { x: 300, y: 280 },
+            { x: 350, y: 150 },  // Highest Peak
+            { x: 420, y: 350 },
+            { x: 480, y: 250 },
+            { x: 560, y: 400 },  // Start Right Pad
+            { x: 640, y: 400 }
+        ];
+
+        let personWaiting = true; // True if person is on the left pad
+        let bullets = [];
+        let enemies = [
+            // Trackers shoot upwards when chopper passes over
+            { x: 250, y: 200, cooldown: 0, type: 'tracker' },
+            // Snipers shoot horizontally creating danger zones above bases
+            { x: 180, y: 360, cooldown: 50, type: 'sniper', dirX: -1 }, // Shoots left towards pickup
+            { x: 480, y: 350, cooldown: 100, type: 'sniper', dirX: 1 }  // Shoots right towards dropoff
+        ];
+
+        // --- PHYSICS & LOGIC ---
+
+        function resetGame() {
+            score = 0;
+            lives = 5;
+            resetChopper();
+        }
+
+        function resetChopper() {
+            chopper.x = pads.right.x + pads.right.width / 2;
+            chopper.y = pads.right.y - chopper.height;
+            chopper.vx = 0;
+            chopper.vy = 0;
+            chopper.hasPerson = false;
+            chopper.crashed = false;
+            personWaiting = true;
+            bullets = [];
+        }
+
+        function getTerrainY(x) {
+            // Find the line segment the chopper is currently over
+            for (let i = 0; i < terrain.length - 1; i++) {
+                if (x >= terrain[i].x && x <= terrain[i+1].x) {
+                    let p1 = terrain[i];
+                    let p2 = terrain[i+1];
+                    // Linear interpolation to find exact Y height at this X
+                    let t = (x - p1.x) / (p2.x - p1.x);
+                    return p1.y + t * (p2.y - p1.y);
+                }
+            }
+            return 480; // Default floor
+        }
+
+        function update() {
+            if (gameState !== 'PLAYING') return;
+            frameCount++;
+
+            // 1. Chopper Physics
+            const thrust = 0.2;
+            const gravity = 0.08;
+            const friction = 0.95;
+
+            if (keys.ArrowUp || keys.w) chopper.vy -= thrust;
+            if (keys.ArrowLeft || keys.a) chopper.vx -= thrust;
+            if (keys.ArrowRight || keys.d) chopper.vx += thrust;
+            if (keys.ArrowDown || keys.s) chopper.vy += thrust;
+
+            chopper.vy += gravity;
+            chopper.vx *= friction;
+            chopper.vy *= friction;
+
+            chopper.x += chopper.vx;
+            chopper.y += chopper.vy;
+
+            // Screen boundaries
+            if (chopper.x < 15) chopper.x = 15;
+            if (chopper.x > canvas.width - 15) chopper.x = canvas.width - 15;
+            if (chopper.y < 10) { chopper.y = 10; chopper.vy = 0; }
+
+            // Audio: Play chopper sound dynamically based on vertical speed
+            let speedRatio = Math.min(1, Math.abs(chopper.vy) / 2);
+            if (!chopper.crashed) playChop(speedRatio);
+
+            // 2. Collision with Terrain
+            let groundY = getTerrainY(chopper.x);
+            // Check if bottom of chopper hits the ground
+            if (chopper.y + chopper.height / 2 >= groundY) {
+                // Check if we are landing safely on a pad
+                let speed = Math.abs(chopper.vy) + Math.abs(chopper.vx);
+                let overLeftPad = chopper.x > pads.left.x && chopper.x < pads.left.x + pads.left.width;
+                let overRightPad = chopper.x > pads.right.x && chopper.x < pads.right.x + pads.right.width;
+
+                if ((overLeftPad || overRightPad) && speed < 3.5) {
+                    // Safe landing!
+                    chopper.y = groundY - chopper.height / 2;
+                    chopper.vy = 0;
+                    chopper.vx = 0;
+
+                    // Rescue Logic
+                    if (overLeftPad && personWaiting && !chopper.hasPerson) {
+                        chopper.hasPerson = true;
+                        personWaiting = false;
+                        // Picked up!
+                    }
+                    else if (overRightPad && chopper.hasPerson) {
+                        chopper.hasPerson = false;
+                        personWaiting = true; // Spawn new person
+                        score += 1; // +1 full rescue!
+                    }
+                } else {
+                    // CRASH! Too fast or hit a mountain
+                    crashChopper();
+                }
+            }
+
+            // 3. Enemies Firing
+            enemies.forEach(enemy => {
+                enemy.cooldown--;
+                if (enemy.cooldown <= 0) {
+                    if (enemy.type === 'tracker') {
+                        // Only fire if chopper is above them
+                        if (chopper.y < enemy.y - 50) {
+                            // Calculate angle to chopper
+                            let dx = chopper.x - enemy.x;
+                            let dy = chopper.y - enemy.y;
+                            let dist = Math.sqrt(dx*dx + dy*dy);
+                            
+                            // Create a bullet ("em-dash" style)
+                            bullets.push({
+                                x: enemy.x,
+                                y: enemy.y - 10,
+                                vx: (dx / dist) * 4,
+                                vy: (dy / dist) * 4,
+                                life: 200
+                            });
+                            playShoot();
+                            enemy.cooldown = 120; // Time between shots
+                        }
+                    } else if (enemy.type === 'sniper') {
+                        // Sniper fires horizontally based on its set direction
+                        bullets.push({
+                            x: enemy.x,
+                            y: enemy.y - 5,
+                            vx: enemy.dirX * 4.5,
+                            vy: 0,
+                            life: 180
+                        });
+                        playShoot();
+                        enemy.cooldown = 140; // Sniper cooldown
+                    }
+                }
+            });
+
+            // 4. Update Bullets & Check Bullet Collisions
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i];
+                b.x += b.vx;
+                b.y += b.vy;
+                b.life--;
+
+                // Check collision with chopper (simple box collision)
+                if (Math.abs(b.x - chopper.x) < chopper.width/2 &&
+                    Math.abs(b.y - chopper.y) < chopper.height/2) {
+                    crashChopper();
+                }
+
+                // Remove old bullets
+                if (b.life <= 0 || b.y > getTerrainY(b.x)) {
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
+        function crashChopper() {
+            lives--;
+            chopper.crashed = true;
+            playCrash(); // Play explosion sound
+            
+            gameState = 'CRASHED'; // Set to crashed first to show the explosion graphics
+
+            if (lives <= 0) {
+                // If it's the last life, show the explosion briefly, then GAME OVER
+                setTimeout(() => {
+                    gameState = 'GAMEOVER';
+                }, 1500);
+            } else {
+                // Pause briefly then reset position to continue playing
+                setTimeout(() => {
+                    resetChopper();
+                    gameState = 'PLAYING';
+                }, 1000);
+            }
+        }
+
+        // --- DRAWING / GRAPHICS ---
+
+        function draw() {
+            // Clear screen to black
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Set global drawing style to white lines
+            ctx.strokeStyle = '#fff';
+            ctx.fillStyle = '#fff';
+            ctx.lineWidth = 2;
+
+            drawTerrain();
+            drawEnemies(); // Draw the turrets to show threat locations
+            drawHUD();
+
+            if (gameState === 'PLAYING' || gameState === 'CRASHED') {
+                drawChopper();
+                drawPeople();
+                drawBullets();
+            }
+
+            if (gameState === 'START') {
+                drawTextCentered("CHOPPER RESCUE", 200, 40);
+                drawTextCentered("PRESS ANY KEY TO START", 260, 20);
+            } else if (gameState === 'GAMEOVER') {
+                drawTextCentered("GAME OVER", 200, 40);
+                drawTextCentered("FINAL SCORE: " + score, 260, 20);
+                drawTextCentered("PRESS ANY KEY FOR TITLE SCREEN", 300, 15);
+            }
+        }
+
+        function drawTerrain() {
+            ctx.beginPath();
+            ctx.moveTo(terrain[0].x, terrain[0].y);
+            for (let i = 1; i < terrain.length; i++) {
+                ctx.lineTo(terrain[i].x, terrain[i].y);
+            }
+            ctx.stroke();
+
+            // Draw "BASE" indicators
+            ctx.font = '14px Courier New';
+            ctx.fillText("PICKUP", pads.left.x + 10, pads.left.y + 20);
+            ctx.fillText("BASE", pads.right.x + 20, pads.right.y + 20);
+        }
+
+        function drawEnemies() {
+            enemies.forEach(enemy => {
+                // Draw a simple retro turret box
+                ctx.strokeRect(enemy.x - 6, enemy.y - 10, 12, 10);
+                
+                ctx.beginPath();
+                if (enemy.type === 'sniper') {
+                    // Draw horizontal barrel
+                    ctx.moveTo(enemy.x, enemy.y - 5);
+                    ctx.lineTo(enemy.x + (enemy.dirX * 12), enemy.y - 5);
+                } else {
+                    // Draw tracker barrel (pointing up)
+                    ctx.moveTo(enemy.x, enemy.y - 10);
+                    ctx.lineTo(enemy.x, enemy.y - 18);
+                }
+                ctx.stroke();
+            });
+        }
+
+        function drawChopper() {
+            if (chopper.crashed) {
+                // Draw explosion particles
+                ctx.beginPath();
+                for(let i=0; i<8; i++) {
+                    ctx.moveTo(chopper.x, chopper.y);
+                    ctx.lineTo(chopper.x + (Math.random()-0.5)*40, chopper.y + (Math.random()-0.5)*40);
+                }
+                ctx.stroke();
+                return;
+            }
+
+            ctx.save();
+            ctx.translate(chopper.x, chopper.y);
+            
+            // Tilt the chopper based on velocity
+            ctx.rotate(chopper.vx * 0.05);
+
+            // Chopper Body (retro outline style)
+            ctx.beginPath();
+            ctx.rect(-12, -6, 24, 12); // Main cabin
+            ctx.moveTo(-12, 0);
+            ctx.lineTo(-24, 0); // Tail boom
+            ctx.lineTo(-26, -6); // Tail fin
+            
+            // Skids
+            ctx.moveTo(-10, 6);
+            ctx.lineTo(-10, 10);
+            ctx.moveTo(10, 6);
+            ctx.lineTo(10, 10);
+            ctx.moveTo(-15, 10);
+            ctx.lineTo(15, 10);
+            ctx.stroke();
+
+            // Main Rotor (Animates based on frame count)
+            ctx.beginPath();
+            ctx.moveTo(0, -6);
+            ctx.lineTo(0, -10); // Rotor mast
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.lineWidth = 3;
+            // Alternate drawing wide and narrow to simulate spinning
+            if (frameCount % 4 < 2) {
+                ctx.moveTo(-20, -10);
+                ctx.lineTo(20, -10);
+            } else {
+                ctx.moveTo(-5, -10);
+                ctx.lineTo(5, -10);
+            }
+            ctx.stroke();
+
+            // Draw person hanging if carrying
+            if (chopper.hasPerson) {
+                drawStickFigure(0, 18);
+            }
+
+            ctx.restore();
+        }
+
+        function drawStickFigure(x, y) {
+            ctx.beginPath();
+            ctx.arc(x, y - 6, 2, 0, Math.PI * 2); // Head
+            ctx.moveTo(x, y - 4);
+            ctx.lineTo(x, y + 2); // Body
+            ctx.moveTo(x - 3, y - 1);
+            ctx.lineTo(x + 3, y - 1); // Arms
+            ctx.moveTo(x, y + 2);
+            ctx.lineTo(x - 3, y + 6); // Left leg
+            ctx.moveTo(x, y + 2);
+            ctx.lineTo(x + 3, y + 6); // Right leg
+            ctx.stroke();
+        }
+
+        function drawPeople() {
+            // Draw the waiting person on the left pad
+            if (personWaiting) {
+                // Flashing effect to draw attention
+                if (frameCount % 60 < 40) {
+                    drawStickFigure(pads.left.x + 40, pads.left.y - 6);
+                }
+            }
+        }
+
+        function drawBullets() {
+            ctx.lineWidth = 2;
+            bullets.forEach(b => {
+                ctx.beginPath();
+                // Draw a line tracing its velocity to look like a flying "dash"
+                ctx.moveTo(b.x, b.y);
+                ctx.lineTo(b.x - b.vx * 2, b.y - b.vy * 2);
+                ctx.stroke();
+            });
+        }
+
+        function drawHUD() {
+            ctx.font = '20px "Courier New", Courier, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(`RESCUED: ${score}`, 20, 30);
+            
+            ctx.textAlign = 'right';
+            ctx.fillText(`LIVES: ${lives}`, canvas.width - 20, 30);
+        }
+
+        function drawTextCentered(text, y, size) {
+            ctx.font = `bold ${size}px "Courier New", Courier, monospace`;
+            ctx.textAlign = 'center';
+            ctx.fillText(text, canvas.width / 2, y);
+        }
+
+        // --- GAME LOOP ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start the loop
+        requestAnimationFrame(gameLoop);
+
+    </script>
+</body>
+</html>
